@@ -60,11 +60,20 @@ func prepareUpstreamCall(requestJSON []byte) (*executorRequestWire, *upstreamReq
 
 // postUpstreamChat sends the adapted request through the per-auth client.
 func postUpstreamChat(built *upstreamRequest) (result *http.Response, err error) {
+	client, err := clientForAuth(built.ProxyURL)
+	if err != nil {
+		return nil, err
+	}
 	request, requestErr := newUpstreamChatRequest(context.Background(), built)
 	if requestErr != nil {
 		return nil, requestErr
 	}
-	return clientForAuth(built.ProxyURL).Do(request)
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("upstream transport failed or request deadline exceeded")
+	}
+	response.Body = &limitedBody{ReadCloser: response.Body, remaining: maxResponseBytes}
+	return response, nil
 }
 
 // upstreamRetryBackoff waits between transient-upstream-failure retries. It is
@@ -95,7 +104,7 @@ func openUpstreamChat(built *upstreamRequest) (*http.Response, error) {
 		if attempt >= len(upstreamRetryBackoff) {
 			return nil, lastErr
 		}
-		fsDebugLog(fmt.Sprintf("upstream attempt %d failed (%v), retrying", attempt+1, lastErr))
+		fsDebugLog(fmt.Sprintf("upstream attempt %d failed; retrying", attempt+1))
 		time.Sleep(upstreamRetryBackoff[attempt])
 	}
 }
@@ -216,6 +225,14 @@ type pumpAbortError struct{ err error }
 func (e *pumpAbortError) Error() string { return e.err.Error() }
 
 func (p *streamPump) run() {
+	defer func() {
+		if recover() != nil {
+			if !p.signaled {
+				p.signal(streamFailErr("Upstream stream processing failed"))
+			}
+			p.closeStream()
+		}
+	}()
 	defer func() { _ = p.body.Close() }()
 	err := p.pump()
 	switch {
@@ -224,7 +241,7 @@ func (p *streamPump) run() {
 	case !p.started:
 		p.signal(asPluginError(err))
 	case isAbort(err):
-		fsDebugLog("stream emit failed (downstream gone): " + err.Error())
+		fsDebugLog("stream emit failed (downstream gone)")
 	default:
 		message := err.Error()
 		if _, isZen := err.(*zenStreamError); !isZen {
@@ -232,7 +249,7 @@ func (p *streamPump) run() {
 		}
 		payload := errorFrameJSON(p.ctx.sseFrame, message)
 		if emitErr := p.emitChunk(payload); emitErr != nil {
-			fsDebugLog("stream error frame emit failed: " + emitErr.Error())
+			fsDebugLog("stream error frame emit failed")
 		}
 		p.closeStream()
 	}

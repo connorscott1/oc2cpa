@@ -150,19 +150,21 @@ func safeParseAny(text string) any {
 // arrive through the callback, [DONE] 通过 nil frame 报告, and the parser
 // owns the trailing usage window and per-choice name restoration state.
 type eventParser struct {
-	body          io.ReadCloser
-	ctx           *streamCtx
-	decoder       textDecoder
-	buffer        string
-	sawAny        bool
-	formatDecided bool
-	sawDone       bool
-	trailingUntil int64
-	choices       map[int]bool
-	finished      map[int]bool
-	names         map[int]*toolCallBook
-	data          []string
-	eventType     string
+	body           io.ReadCloser
+	ctx            *streamCtx
+	decoder        textDecoder
+	buffer         string
+	sawAny         bool
+	formatDecided  bool
+	sawDone        bool
+	trailingUntil  int64
+	choices        map[int]bool
+	finished       map[int]bool
+	names          map[int]*toolCallBook
+	data           []string
+	eventType      string
+	dataBytes      int
+	eventOversized bool
 }
 
 func newEventParser(body io.ReadCloser, ctx *streamCtx) *eventParser {
@@ -203,6 +205,9 @@ func (p *eventParser) run(onFrame func(frame map[string]any) error) error {
 			p.sawAny = true
 		}
 		p.buffer += text
+		if len(p.buffer) > maxEventBytes {
+			return &zenStreamError{message: "Upstream SSE line exceeds size limit"}
+		}
 		if !p.formatDecided {
 			lead := strings.TrimLeft(p.buffer, " \t\r\n\v\f")
 			if lead != "" {
@@ -219,6 +224,9 @@ func (p *eventParser) run(onFrame func(frame map[string]any) error) error {
 		p.buffer = lines[len(lines)-1]
 		for _, line := range lines[:len(lines)-1] {
 			eventPayload, eventKind := p.readLine(line)
+			if p.eventOversized {
+				return &zenStreamError{message: "Upstream SSE event exceeds size limit"}
+			}
 			if eventPayload == "" {
 				continue
 			}
@@ -273,6 +281,11 @@ func (p *eventParser) readLine(line string) (string, string) {
 	}
 	switch field {
 	case "data":
+		if len(value) > maxEventBytes-p.dataBytes {
+			p.eventOversized = true
+			return "", ""
+		}
+		p.dataBytes += len(value) + 1
 		p.data = append(p.data, value)
 	case "event":
 		p.eventType = value
@@ -284,6 +297,7 @@ func (p *eventParser) takeEvent() (string, string) {
 	payload := strings.Join(p.data, "\n")
 	kind := p.eventType
 	p.data = nil
+	p.dataBytes = 0
 	p.eventType = ""
 	payload = strings.TrimSpace(payload)
 	if payload == "" {
@@ -623,6 +637,9 @@ func readErrorText(reader io.ReadCloser, ctx *streamCtx, status int, initialText
 		message = fmt.Sprintf("Upstream returned HTTP %d", status)
 	}
 	logUpstreamBody(ctx.requestID, ctx.model, status, text, message)
+	if len(message) > 512 {
+		message = message[:512]
+	}
 	return message
 }
 
@@ -702,12 +719,9 @@ func choiceIndex(choice map[string]any) int {
 // ----------------------------------------------------------------------------
 
 func logUpstreamBody(requestID, model string, status int, text, zenMessage string) {
-	preview := strings.Join(strings.Fields(text), " ")
-	if len(preview) > 800 {
-		preview = preview[:800]
-	}
-	entry := fmt.Sprintf(`[ZEN BODY] {"requestId":%q,"model":%q,"status":%d,"preview":%q,"zenError":%q}`,
-		requestID, model, status, preview, zenMessage)
+	// Upstream errors may echo prompts, credentials, or proxy URLs.
+	entry := fmt.Sprintf(`[ZEN ERROR] {"requestId":%q,"model":%q,"status":%d}`,
+		requestID, model, status)
 	fsDebugLog(entry)
 }
 

@@ -73,6 +73,9 @@ type upstreamRequest struct {
 // payload into the upstream body. It is the faithful port of zen.js
 // buildUpstreamRequest + handler.chat request-side validation.
 func buildUpstreamRequest(ctx context.Context, payload []byte, requestedModel string, auth ocAuthView) (*upstreamRequest, error) {
+	if len(payload) > maxRequestBytes {
+		return nil, &ocError{Code: "invalid_request_error", Message: "Request exceeds size limit", HTTPStatus: 413}
+	}
 	if !isAllowedModelID(requestedModel) {
 		return nil, &ocError{Code: "invalid_request_error", Message: "Only big-pickle and models ending in -free are allowed", HTTPStatus: 400}
 	}

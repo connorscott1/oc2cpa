@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -89,6 +89,7 @@ var modelCacheMu sync.Mutex
 var modelCacheTTL = 5 * time.Minute
 var modelCacheTime time.Time
 var modelCache []pluginapi.ModelInfo
+var modelCacheGeneration uint64
 
 // hostProxyMu/…HostProxy cache the host's globally configured upstream proxy
 // (HostConfigSummary.ProxyURL). The executor RPC requests do not carry it, but
@@ -116,6 +117,7 @@ func readHostProxy() string {
 func invalidateModelCache() {
 	modelCacheMu.Lock()
 	defer modelCacheMu.Unlock()
+	modelCacheGeneration++
 	modelCacheTime = time.Time{}
 	modelCache = nil
 }
@@ -178,13 +180,18 @@ func mergeCatalog(base []pluginapi.ModelInfo, discovered []pluginapi.ModelInfo) 
 // the static catalog.
 func discoveredModels() []pluginapi.ModelInfo {
 	modelCacheMu.Lock()
-	defer modelCacheMu.Unlock()
 	if len(modelCache) > 0 && time.Since(modelCacheTime) < modelCacheTTL {
-		return modelCache
+		cached := append([]pluginapi.ModelInfo(nil), modelCache...)
+		modelCacheMu.Unlock()
+		return cached
 	}
+	generation := modelCacheGeneration
+	cached := append([]pluginapi.ModelInfo(nil), modelCache...)
+	modelCacheMu.Unlock()
+	// Never hold a cache lock while reading configuration or doing network I/O.
 	body, err := fetchUpstreamModels()
 	if err != nil || len(body) == 0 {
-		return modelCache
+		return cached
 	}
 	var parsed struct {
 		Data []struct {
@@ -192,7 +199,7 @@ func discoveredModels() []pluginapi.ModelInfo {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return modelCache
+		return cached
 	}
 	out := make([]pluginapi.ModelInfo, 0, len(parsed.Data))
 	for _, item := range parsed.Data {
@@ -202,11 +209,16 @@ func discoveredModels() []pluginapi.ModelInfo {
 		out = append(out, buildModelInfo(item.ID))
 	}
 	if len(out) == 0 {
-		return modelCache
+		return cached
+	}
+	modelCacheMu.Lock()
+	defer modelCacheMu.Unlock()
+	if generation != modelCacheGeneration {
+		return nil
 	}
 	modelCache = out
 	modelCacheTime = time.Now()
-	return out
+	return append([]pluginapi.ModelInfo(nil), out...)
 }
 
 func fetchUpstreamModels() ([]byte, error) {
@@ -216,7 +228,14 @@ func fetchUpstreamModels() ([]byte, error) {
 		return nil, err
 	}
 
-	response, err := sharedHTTPClient().Do(request)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	request = request.WithContext(ctx)
+	client, err := sharedHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +244,7 @@ func fetchUpstreamModels() ([]byte, error) {
 		message := readErrorText(response.Body, modelDiscoveryCtx(), response.StatusCode, "", &textDecoder{})
 		return nil, mapUpstreamFailure(response.StatusCode, message).asError()
 	}
-	body, err := io.ReadAll(response.Body)
+	body, err := readAllBounded(response.Body, maxCatalogBytes)
 	if err != nil {
 		return nil, err
 	}
