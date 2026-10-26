@@ -245,3 +245,27 @@ func TestDiagnosticsOmitBodiesAndKeyPrefixes(t *testing.T) {
 		t.Fatal("client label leaks key or is unstable")
 	}
 }
+
+func TestConfigurationFormatsAndFailClosed(t *testing.T) {
+	for _, raw := range []string{
+		"upstream_base_url: http://127.0.0.1:12345\ndynamic_models: true\nusage_log: false\n",
+		`{"enabled":true,"upstream_base_url":"http://127.0.0.1:12345","dynamic_models":true,"usage_log":false}`,
+		`{enabled: true, priority: 10, upstream_base_url: "http://127.0.0.1:12345", dynamic_models: true, usage_log: false}`,
+	} {
+		cfg, err := parseSettings([]byte(raw))
+		if err != nil || cfg.UpstreamBaseURL != "http://127.0.0.1:12345" || !cfg.DynamicModels || cfg.UsageLog {
+			t.Fatalf("configuration ignored: %+v %v", cfg, err)
+		}
+	}
+	for _, raw := range []string{`upstream_base_url: [`, `upstream_base_url: ftp://PRIVATE:secret@host`, `dynamic_models: PRIVATE`} {
+		if _, err := parseSettings([]byte(raw)); err == nil || strings.Contains(err.Error(), "PRIVATE") {
+			t.Fatalf("bad configuration accepted or leaked: %v", err)
+		}
+	}
+	before := readSettings()
+	req, _ := json.Marshal(map[string]any{"config_yaml": []byte(`dynamic_models: [`)})
+	out, err := handleMethod(pluginabi.MethodPluginReconfigure, req)
+	if err != nil || !strings.Contains(string(out), `"ok":false`) || readSettings() != before {
+		t.Fatalf("bad reload did not fail closed: %s %v", out, err)
+	}
+}

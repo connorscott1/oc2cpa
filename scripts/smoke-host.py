@@ -33,6 +33,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--host',type=Path)
     parser.add_argument('--download',action='store_true')
+    parser.add_argument('--live',action='store_true',help='Explicitly test public OpenCode free inference with a harmless prompt')
     args=parser.parse_args()
     manifests=list((ROOT/'dist').rglob('*.build.json'))
     if len(manifests)!=1:
@@ -46,7 +47,10 @@ def main():
         def do_GET(self):
             raw=json.dumps({'data':[{'id':'review-test-free'}]}).encode()
             self.send_response(200);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+        def do_CONNECT(self):
+            self.send_error(403, 'Mock test forbids external TLS tunnels')
         def do_POST(self):
+            assert self.path.startswith((f'http://127.0.0.1:{mock.server_port}/', '/')), 'Unexpected upstream destination'
             body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert self.headers.get('Authorization')=='Bearer public'
             assert self.headers.get('x-opencode-session','').startswith('ses_')
@@ -75,7 +79,7 @@ def main():
         plugins=base/'plugins';plugins.mkdir()
         shutil.copy2(library,plugins/library.name)
         credential=auth/'oc2cpa.json'
-        original=json.dumps({'type':'oc2cpa','label':'preserve-this-label','proxy_url':'','note':'preserve-this-note'}).encode()
+        original=json.dumps({'type':'oc2cpa','label':'preserve-this-label','proxy_url':'' if args.live else f'http://127.0.0.1:{mock.server_port}','note':'preserve-this-note'}).encode()
         credential.write_bytes(original)
         port=free_port()
         config=base/'config.yaml'
@@ -85,7 +89,7 @@ def main():
           'management':{'allow-remote':False,'secret-key':'local-smoke-management','disable-control-panel':True,'disable-auto-update-panel':True},
           'access':{'api-keys':['local-smoke-client']},
           'oauth':{'auth-dir':str(auth)},
-          'plugins':{'enabled':True,'dir':str(plugins),'configs':{'oc2cpa':{'enabled':True,'upstream_base_url':f'http://127.0.0.1:{mock.server_port}','dynamic_models':False}}},
+          'plugins':{'enabled':True,'dir':str(plugins),'configs':{'oc2cpa':{'enabled':True,'upstream_base_url':'https://opencode.ai/inference/openai/v1' if args.live else f'http://127.0.0.1:{mock.server_port}','request_timeout_ms':60000,'dynamic_models':False}}},
           'logging':{'to-file':False},
         }
         config.write_text(json.dumps(cfg)) # JSON is valid YAML.
@@ -96,7 +100,7 @@ def main():
           try:
             def request(path,payload=None,key='local-smoke-client'):
                 req=urllib.request.Request(f'http://127.0.0.1:{port}'+path,data=None if payload is None else json.dumps(payload).encode(),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'})
-                with urllib.request.urlopen(req,timeout=15) as response:return response.read()
+                with urllib.request.urlopen(req,timeout=90 if args.live else 15) as response:return response.read()
             deadline=time.monotonic()+30
             while True:
                 if proc.poll() is not None: raise AssertionError('Host exited: '+log.read_text())
@@ -107,8 +111,30 @@ def main():
                 if time.monotonic()>deadline:raise AssertionError('Host/plugin did not become ready: '+log.read_text())
                 time.sleep(.1)
             assert credential.read_bytes()==original,'Registration overwrote the existing credential'
+            if args.live:
+                results=[]
+                for model in ('big-pickle','mimo-v2.6-flash-free','deepseek-v4.1-flash-free','glm-5.3-flash-free'):
+                    payload={'model':model,'stream':False,'max_tokens':64,'messages':[{'role':'user','content':'Reply with exactly OC2CPA_OK. This is a connectivity test.'}]}
+                    try:
+                        data=json.loads(request('/v1/chat/completions',payload))
+                        content=data['choices'][0]['message'].get('content')
+                        result={'model':model,'status':200,'content':content,'streaming':None}
+                        payload['stream']=True
+                        try:
+                            streamed=request('/v1/chat/completions',payload).decode()
+                            result['streaming']={'status':200,'received_data':bool(streamed),'contains_text': 'OC2CPA_OK' in streamed}
+                        except urllib.error.HTTPError as error:
+                            result['streaming']={'status':error.code,'error':error.read().decode()[:512]}
+                        results.append(result)
+                    except urllib.error.HTTPError as error:
+                        results.append({'model':model,'status':error.code,'error':error.read().decode()[:512]})
+                print(json.dumps({'host':'v8.0.44','plugin_source':manifest['source_commit'],'mode':'live-public-free-tier','upstream':'https://opencode.ai/inference/openai/v1','personal_credentials_used':False,'results':results},indent=2))
+                return
             for stream in (False,True):
-                data=request('/v1/chat/completions',{'model':'big-pickle','stream':stream,'messages':[{'role':'user','content':'local mock test'}]})
+                try:
+                    data=request('/v1/chat/completions',{'model':'big-pickle','stream':stream,'messages':[{'role':'user','content':'local mock test'}]})
+                except urllib.error.HTTPError as error:
+                    raise AssertionError('Mock inference failed: '+error.read().decode()+'\n'+log.read_text()) from error
                 assert b'mock-only-ok' in data, data
                 if not stream:assert json.loads(data)['choices'][0]['message']['content']=='mock-only-ok'
             try:

@@ -220,7 +220,9 @@ func marshalOKEnvelope(result any) []byte {
 func handleMethod(method string, requestJSON []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
-		configure(requestJSON)
+		if err := configure(requestJSON); err != nil {
+			return marshalErrorEnvelope("invalid_configuration", err.Error(), 400), nil
+		}
 		bootstrapAuthOnce()
 		return marshalOKEnvelope(registration()), nil
 	case pluginabi.MethodPluginQuiesce:

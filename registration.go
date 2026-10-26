@@ -2,12 +2,13 @@ package main
 
 import (
 	"encoding/json"
-	"regexp"
-	"strconv"
+	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 // providerName is the stable identity of this provider: it is the executor and
@@ -39,18 +40,22 @@ type pluginSettings struct {
 	UsageLog         bool
 }
 
-func configure(requestJSON []byte) {
+func configure(requestJSON []byte) error {
 	var req struct {
 		ConfigYAML []byte `json:"config_yaml"`
 	}
 	if err := json.Unmarshal(requestJSON, &req); err != nil {
-		return
+		return fmt.Errorf("invalid plugin configuration envelope")
 	}
-	parsed := parseSettings(req.ConfigYAML)
+	parsed, err := parseSettings(req.ConfigYAML)
+	if err != nil {
+		return err
+	}
 	settingsMu.Lock()
 	settings = parsed
 	settingsMu.Unlock()
 	invalidateModelCache()
+	return nil
 }
 
 func readSettings() pluginSettings {
@@ -59,59 +64,31 @@ func readSettings() pluginSettings {
 	return settings
 }
 
-// configLineRe matches one top-level "key: value" line of the plugin section.
-var configLineRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)$`)
-
-// parseSettings does a deliberately minimal line-based read of the YAML section.
-// Supported keys: upstream_base_url (string), connect_timeout_ms (int),
-// dynamic_models (bool), usage_log (bool). Only top-level "key: value" lines
-// are considered; the section is flat, so this avoids pulling a YAML
-// dependency into the plugin.
-func parseSettings(configYAML []byte) pluginSettings {
-	parsed := pluginSettings{
-		UpstreamBaseURL:  "https://opencode.ai/inference/v1",
-		ConnectTimeoutMS: 60_000,
-		RequestTimeoutMS: 600_000,
-		DynamicModels:    false,
-		UsageLog:         true,
+// Decode real YAML, including flow-style mappings retained by the host when
+// the main configuration was written as JSON. Invalid settings must never
+// silently send a request to the default upstream instead.
+func parseSettings(configYAML []byte) (pluginSettings, error) {
+	cfg := struct {
+		UpstreamBaseURL  string `yaml:"upstream_base_url"`
+		ConnectTimeoutMS int    `yaml:"connect_timeout_ms"`
+		RequestTimeoutMS int    `yaml:"request_timeout_ms"`
+		DynamicModels    bool   `yaml:"dynamic_models"`
+		UsageLog         bool   `yaml:"usage_log"`
+	}{UpstreamBaseURL: "https://opencode.ai/inference/v1", ConnectTimeoutMS: 60_000, RequestTimeoutMS: 600_000, UsageLog: true}
+	if err := yaml.Unmarshal(configYAML, &cfg); err != nil {
+		return pluginSettings{}, fmt.Errorf("invalid plugin settings YAML")
 	}
-	for line := range strings.SplitSeq(strings.ReplaceAll(string(configYAML), "\r\n", "\n"), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		match := configLineRe.FindStringSubmatch(trimmed)
-		if match == nil {
-			continue
-		}
-		key, value := match[1], strings.TrimSpace(match[2])
-		value = strings.Trim(value, `"'`)
-		if i := strings.Index(value, " #"); i >= 0 {
-			value = strings.TrimSpace(value[:i])
-		}
-		switch key {
-		case "upstream_base_url":
-			if value != "" {
-				parsed.UpstreamBaseURL = strings.TrimRight(value, "/")
-			}
-		case "connect_timeout_ms":
-			if n, err := strconv.Atoi(value); err == nil {
-				parsed.ConnectTimeoutMS = clampConnectTimeout(n)
-			}
-		case "request_timeout_ms":
-			if n, err := strconv.Atoi(value); err == nil {
-				parsed.RequestTimeoutMS = max(1, min(n, 1_800_000))
-			}
-		case "dynamic_models":
-			parsed.DynamicModels = value == "true"
-		case "usage_log":
-			parsed.UsageLog = value == "" || value == "true"
-		}
+	cfg.UpstreamBaseURL = strings.TrimRight(strings.TrimSpace(cfg.UpstreamBaseURL), "/")
+	target, err := url.Parse(cfg.UpstreamBaseURL)
+	if err != nil || target.Hostname() == "" || target.User != nil || target.RawQuery != "" || target.Fragment != "" || (target.Scheme != "http" && target.Scheme != "https") {
+		return pluginSettings{}, fmt.Errorf("invalid upstream base URL")
 	}
-	if parsed.ConnectTimeoutMS == 0 {
-		parsed.ConnectTimeoutMS = 60_000
-	}
-	return parsed
+	return pluginSettings{
+		UpstreamBaseURL:  cfg.UpstreamBaseURL,
+		ConnectTimeoutMS: clampConnectTimeout(cfg.ConnectTimeoutMS),
+		RequestTimeoutMS: max(1, min(cfg.RequestTimeoutMS, 1_800_000)),
+		DynamicModels:    cfg.DynamicModels, UsageLog: cfg.UsageLog,
+	}, nil
 }
 
 // clampConnectTimeout bounds the connect timeout the same way the original

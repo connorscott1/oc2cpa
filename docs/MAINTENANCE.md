@@ -23,7 +23,11 @@ the saved management key. UI interactions are not covered by the mock test.
    `scripts/smoke-host.py` against the exact intended host release. Verify both
    streaming and aggregate responses, management authentication, existing
    credential preservation, and reload behavior. Test live OpenCode inference
-   separately before installation: the mock does not establish upstream access.
+   separately before installation: the mock does not establish upstream access. Run the explicitly opt-in
+   `python3 scripts/smoke-host.py --download --live` for a benign live free-tier
+   check; it records provider rejections honestly and does not rotate IPs or
+   retry rate-limit responses. Each temporary host/auth directory is deleted
+   and the process stopped on success or failure.
 5. Merge only after the results and any remaining limitations are reviewed.
    No scheduled syncing, automatic merging, dependency update bot, or automatic
    installation is configured.
@@ -80,6 +84,9 @@ or installed. User approval/testing precedes installation.
 
 ## Runtime changes and remaining boundaries
 
+- Block-style YAML, flow-style YAML, and JSON configuration are decoded with
+  pinned yaml.v3 v3.0.1. Invalid settings fail closed instead of silently
+  replacing a configured upstream with the default.
 - Existing credential names/providers are detected through the host envelope;
   the plugin's own bootstrap calls are serialized and do not intentionally save
   over existing entries. The host API has no atomic create-only flag: concurrent
