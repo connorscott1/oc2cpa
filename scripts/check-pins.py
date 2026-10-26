@@ -9,6 +9,7 @@ mod=(root/"go.mod").read_text()
 assert re.search(r"^go "+re.escape(lock["go_version"])+r"$",mod,re.M)
 assert (root/".go-version").read_text().strip()==lock["go_version"]
 assert "github.com/router-for-me/CLIProxyAPI/v8 "+lock["host_version"] in mod
+assert "gopkg.in/yaml.v3 "+lock["yaml_version"] in mod
 assert not re.search(r"^replace\b",mod,re.M), "local dependency replacements cannot ship"
 assert re.fullmatch(r"[a-f0-9]{40}",lock["reviewed_commit"])
 assert re.fullmatch(r"[a-f0-9]{40}",lock["host_commit"])

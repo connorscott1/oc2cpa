@@ -63,6 +63,7 @@ jobs:
           cache: false
       - run: go test -mod=readonly ./...
       - run: python3 scripts/build.py
+      - run: python3 scripts/smoke-abi.py
       - name: Smoke test exact CLIProxyAPI v8.0.44
         if: matrix.target == 'linux_amd64'
         run: python3 scripts/smoke-host.py --download

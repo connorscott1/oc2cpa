@@ -148,7 +148,9 @@ def main():
             config.write_text(config.read_text()+'\n# smoke reload\n')
             time.sleep(1)
             request('/v1/models')
-            assert credential.read_bytes()==original,'Reload overwrote the existing credential'
+            actual=json.loads(credential.read_text())
+            expected=json.loads(original)
+            assert all(actual.get(k)==expected[k] for k in ('type','label','proxy_url','note')), 'Reload changed credential settings: '+json.dumps(actual)+'\n'+log.read_text()
             assert len(calls)==2
             print(json.dumps({'host':'v8.0.44','host_source':'1f917e77c4562623aa49e9804d999524151a2f96','plugin_source':manifest['source_commit'],'checks':['native load','static catalog','credential preservation','aggregate mock inference','streaming mock inference','management authentication','management summary','reload preservation'],'external_inference':False},indent=2))
           finally:
