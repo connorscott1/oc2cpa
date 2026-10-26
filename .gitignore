@@ -8,3 +8,6 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+release-artifacts/
+release-out/
+__pycache__/

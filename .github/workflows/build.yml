@@ -1,366 +1,114 @@
-# Multi-arch build & release for the oc2cpa CLIProxyAPI plugin (Go c-shared port
-# of the original Node.js oc2api proxy).
-#
-#   - tag 'v*'          → release that version (the official CLIProxyAPI plugin
-#                         store requires the release tag to be v<version>)
-#   - workflow_dispatch → pick a version manually
-#   - plain push/PR     → CI builds + tests only (artifacts, no release)
-#
-# Asset naming matches CLIProxyAPI pluginstore ArchiveName():
-#   <id>_<version>_<goos>_<goarch>.zip   (zip root: <id>.so|.dylib|.dll)
-
-name: Build
-
+name: Reviewed build
 on:
   pull_request:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: [main, harden-pinned-builds]
+    tags: ['v*']
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version without v (empty = the plugin's VERSION file)"
-        required: false
-        default: ""
-
 permissions:
-  contents: write
-
+  contents: read
+concurrency:
+  group: reviewed-build-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   test:
-    name: Test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Validate registry.json
-        working-directory: .
-        run: python3 .github/scripts/validate-registry.py registry.json
-      - name: Check formatting
-        run: |
-          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - name: Test
-        run: go test ./...
-      - name: Vet
-        run: go vet ./...
-
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: .go-version
+          cache: false
+      - run: python3 scripts/check-pins.py
+      - run: python3 .github/scripts/validate-registry.py registry.json
+      - run: test -z "$(gofmt -l .)"
+      - run: go mod verify
+      - run: go test -mod=readonly -race ./...
+      - run: go vet -mod=readonly ./...
   build:
-    name: oc2cpa ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test
-    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
+          - runner: ubuntu-24.04
+            target: linux_amd64
+          - runner: ubuntu-24.04-arm
+            target: linux_arm64
+          - runner: macos-15-intel
+            target: darwin_amd64
+          - runner: macos-15
+            target: darwin_arm64
+          - runner: windows-2025
+            target: windows_amd64
+    runs-on: ${{ matrix.runner }}
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: Resolve release metadata
-        run: |
-          set -euo pipefail
-          # Version resolution: this plugin's tag > dispatch input > VERSION file
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="$(tr -d ' \n\r' < VERSION)"
-          fi
-          CLEAN_VERSION="${VERSION%%+*}"
-          echo "VERSION=${CLEAN_VERSION}" >> "${GITHUB_ENV}"
-          echo "LIB_NAME=oc2cpa.${{ matrix.ext }}" >> "${GITHUB_ENV}"
-          echo "ARCHIVE_NAME=oc2cpa_${CLEAN_VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
-          echo "version=${CLEAN_VERSION} archive=oc2cpa_${CLEAN_VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
-
-      - name: Build shared library
-        env:
-          # Pin the deployment target: clang defaults it to the runner's macOS
-          # version, which would ship dylibs declaring a minos newer than the
-          # oldest supported systems.
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.goos == 'darwin' && '11.0' || '' }}
-          # Keep dylibs/dlls from stealing runtime state during host teardown.
-          GOFLAGS: -trimpath
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -buildmode=c-shared \
-              -ldflags "-s -w -X main.version=${VERSION}" \
-              -o "dist/${LIB_NAME}" .
-          rm -f dist/*.h || true
-          file "dist/${LIB_NAME}" || true
-
-      - name: Verify darwin deployment target and ABI exports
-        if: matrix.goos == 'darwin'
-        run: python3 .github/scripts/check-darwin-dylib.py "dist/${LIB_NAME}"
-
-      - name: Package plugin (CPA ArchiveName)
-        working-directory: .
-        run: |
-          set -euo pipefail
-          go run ./.github/scripts/package-release.go \
-            -library "dist/${LIB_NAME}" \
-            -archive "${ARCHIVE_NAME}" \
-            -checksum "${ARCHIVE_NAME}.sha256"
-          python3 - <<'PY'
-          import zipfile, os, sys
-          name = os.environ["ARCHIVE_NAME"]
-          lib = os.environ["LIB_NAME"]
-          with zipfile.ZipFile(name) as z:
-              names = z.namelist()
-              print("zip entries:", names)
-              if lib not in names:
-                  sys.exit(f"zip root missing {lib}: {names}")
-          PY
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          name: ${{ env.ARCHIVE_NAME }}
+          go-version-file: .go-version
+          cache: false
+      - run: go test -mod=readonly ./...
+      - run: python3 scripts/build.py
+      - name: Smoke test exact CLIProxyAPI v8.0.44
+        if: matrix.target == 'linux_amd64'
+        run: python3 scripts/smoke-host.py --download
+      - name: Attest committed artifacts
+        if: github.event_name == 'push' && github.repository == 'connorscott1/oc2cpa'
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: 'dist/**/*.zip'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oc2cpa-${{ matrix.target }}-${{ github.sha }}
           path: |
-            ${{ env.ARCHIVE_NAME }}
-            ${{ env.ARCHIVE_NAME }}.sha256
+            dist/**/*.zip
+            dist/**/*.build.json
+            dist/**/checksums.txt
           if-no-files-found: error
-
-  build-cross:
-    name: oc2cpa ${{ matrix.target }} (go-cross)
-    needs: test
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: windows-arm64
-            ext: dll
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: Resolve release metadata
-        id: meta
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="$(tr -d ' \n\r' < VERSION)"
-          fi
-          CLEAN_VERSION="${VERSION%%+*}"
-          GOOS_PART="${{ matrix.target }}"
-          echo "VERSION=${CLEAN_VERSION}" >> "${GITHUB_ENV}"
-          echo "version=${CLEAN_VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "ARCHIVE_NAME=oc2cpa_${CLEAN_VERSION}_${GOOS_PART%-*}_${GOOS_PART#*-}.zip" >> "${GITHUB_ENV}"
-          echo "LIB_NAME=oc2cpa.${{ matrix.ext }}" >> "${GITHUB_ENV}"
-
-      - name: Build cross shared library
-        timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
-        env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: .
-          packages: .
-          targets: ${{ matrix.target }}
-          out-dir: dist/${{ matrix.target }}
-          output: ${{ env.LIB_NAME }}
-          flags: -ldflags=-s -w
-          x-flags: main.version=${{ steps.meta.outputs.version }}
-
-      - name: Package plugin
-        run: |
-          set -euo pipefail
-          rm -f go-cross-bin.h dist/*.h || true
-          LIB=""
-          for p in \
-            "dist/${{ matrix.target }}/${LIB_NAME}" \
-            "dist/${LIB_NAME}"; do
-            if [ -f "$p" ]; then LIB="$p"; break; fi
-          done
-          if [ -z "$LIB" ]; then
-            echo "library not found"; find . -name '*.dll' -o -name '*.so' | head
-            exit 1
-          fi
-          go run ./.github/scripts/package-release.go \
-            -library "${LIB}" \
-            -archive "${ARCHIVE_NAME}" \
-            -checksum "${ARCHIVE_NAME}.sha256"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARCHIVE_NAME }}
-          path: |
-            ${{ env.ARCHIVE_NAME }}
-            ${{ env.ARCHIVE_NAME }}.sha256
-          if-no-files-found: error
-
   release:
-    name: Release
-    # Only for a version tag, or a dispatch WITH a version.
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '') ||
-      startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - build
-      - build-cross
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'connorscott1/oc2cpa'
+    needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
-
-      - name: Resolve version
-        id: meta
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ github.event.inputs.version }}"
-            TAG="v${V}"
-          else
-            V="${GITHUB_REF_NAME#v}"
-            # Release under the exact tag that was pushed, so pushing v0.2.0
-            # produces a v0.2.0 release (what the official plugin store reads).
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Releasing ${TAG} (version $V)"
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify tag matches reviewed version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: test "$RELEASE_TAG" = "v$(cat VERSION)"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: dist
-          merge-multiple: true
-
-      - name: Assemble checksums.txt
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          mv dist/oc2cpa_${VERSION}_*.zip* out/ 2>/dev/null || true
-          ls -la out/
-          if ls out/*.sha256 >/dev/null 2>&1; then
-            sort out/*.sha256 > out/checksums.txt
-          else
-            (cd out && sha256sum *.zip > checksums.txt)
-          fi
-          cat out/checksums.txt
-          # Every platform the host can ask for must be present.
-          for t in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 windows_arm64; do
-            test -f "out/oc2cpa_${VERSION}_${t}.zip" || { echo "missing oc2cpa_${VERSION}_${t}.zip"; exit 1; }
-          done
-
-      - name: Stamp registry.json with the released version
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os, pathlib
-          v = os.environ["VERSION"]
-          p = pathlib.Path("registry.json")
-          data = json.loads(p.read_text())
-          for plug in data.get("plugins", []):
-              if plug.get("id") == "oc2cpa":
-                  plug["version"] = v
-                  plug["release_tag"] = f"v{v}"
-          p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-          print(p.read_text())
-          PY
-          python3 .github/scripts/validate-registry.py registry.json
-          # The release carries this file as an asset too, because the workflow
-          # cannot commit the bump back to the branch. A host that points its
-          # store-source at the release always sees the right version.
-          cp registry.json out/registry.json
-
-      - name: Publish GitHub release
+          path: release-artifacts
+          pattern: oc2cpa-*-${{ github.sha }}
+          merge-multiple: false
+      - name: Assemble release
+        run: python3 scripts/assemble-release.py
+      - name: Create new draft; existing releases must never be replaced
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-              git tag -a "${TAG}" -m "Release oc2cpa plugin v${VERSION}"
-              git push origin "${TAG}"
-            fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing replacement.' >&2
+            exit 1
           fi
-          NOTES=$(cat <<EOF
-          ## oc2cpa CLIProxyAPI plugin v${VERSION}
-
-          OpenCode Zen free models for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI),
-          as an external c-shared plugin — no extra server process, no extra HTTP hop.
-
-          ### Assets (pluginstore \`ArchiveName(id, version, goos, goarch)\`)
-          | File | Contents |
-          |---|---|
-          | \`oc2cpa_${VERSION}_linux_amd64.zip\` | \`oc2cpa.so\` |
-          | \`oc2cpa_${VERSION}_linux_arm64.zip\` | \`oc2cpa.so\` |
-          | \`oc2cpa_${VERSION}_darwin_amd64.zip\` | \`oc2cpa.dylib\` |
-          | \`oc2cpa_${VERSION}_darwin_arm64.zip\` | \`oc2cpa.dylib\` |
-          | \`oc2cpa_${VERSION}_windows_amd64.zip\` | \`oc2cpa.dll\` |
-          | \`oc2cpa_${VERSION}_windows_arm64.zip\` | \`oc2cpa.dll\` |
-          | \`checksums.txt\` | SHA-256 of the zips |
-          | \`registry.json\` | plugin-source manifest for this version |
-
-          ### Install via plugin source
-          \`\`\`
-          ${REPO_URL}/releases/latest/download/registry.json
-          \`\`\`
-
-          ### Manual install (linux/amd64)
-          \`\`\`bash
-          unzip oc2cpa_${VERSION}_linux_amd64.zip
-          cp oc2cpa.so /path/to/cliproxyapi/plugins/oc2cpa.so
-          \`\`\`
-          EOF
-          )
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" out/*.zip out/checksums.txt out/registry.json --clobber --repo "${GITHUB_REPOSITORY}"
-          else
-            gh release create "${TAG}" out/*.zip out/checksums.txt out/registry.json \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "oc2cpa plugin v${VERSION}" \
-              --notes "${NOTES}"
-          fi
+          gh release create "$RELEASE_TAG" --verify-tag --draft --title "OC2CPA $RELEASE_TAG" --notes-file docs/RELEASE-NOTES.md release-out/*

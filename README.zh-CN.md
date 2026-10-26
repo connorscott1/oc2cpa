@@ -1,3 +1,5 @@
+> Fork maintenance, security changes, and pinned builds: [docs/MAINTENANCE.md](docs/MAINTENANCE.md). The upstream usage examples below do not replace the fork verification process.
+
 # oc2cpa — CLIProxyAPI 的 OpenCode 免费模型插件
 
 [English](README.md) | 简体中文
@@ -50,7 +52,7 @@ provider。
 plugins:
   enabled: true
   store-sources:
-    - https://github.com/dingguotu/oc2cpa/releases/latest/download/registry.json
+    - https://github.com/connorscott1/oc2cpa/releases/download/v0.4.4-connorscott.1/registry.json
 ```
 
 然后在 CLIProxyAPI 管理界面安装 `oc2cpa`。

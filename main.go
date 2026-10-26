@@ -115,13 +115,23 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 // cliproxyPluginFree.
 //
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (rc C.int) {
+	defer func() {
+		if recover() != nil {
+			writeResponseBytes(response, marshalErrorEnvelope("plugin_panic", "plugin request failed safely", 500))
+			rc = 1
+		}
+	}()
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
 	if method == nil {
 		writeResponseBytes(response, marshalErrorEnvelope("invalid_method", "method is required"))
+		return 1
+	}
+	if response == nil || uint64(requestLen) > maxRPCBytes || (request == nil && requestLen > 0) {
+		writeResponseBytes(response, marshalErrorEnvelope("invalid_request", "invalid or oversized plugin request", 413))
 		return 1
 	}
 	var requestBytes []byte
@@ -170,6 +180,9 @@ func cliproxyPluginShutdown() {}
 func writeResponseBytes(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
 		return
+	}
+	if len(raw) > maxRPCBytes {
+		raw = marshalErrorEnvelope("response_too_large", "plugin response exceeds size limit", 502)
 	}
 	ptr := C.CBytes(raw)
 	if ptr == nil {
@@ -268,6 +281,9 @@ const (
 // their own. The request is copied into C memory once per call, matching the
 // plugin ABI ownership contract.
 func goHostCall(method string, requestJSON []byte) ([]byte, error) {
+	if len(requestJSON) > maxRPCBytes {
+		return nil, fmt.Errorf("host callback request exceeds size limit")
+	}
 	cMethod := C.CString(method)
 	defer C.free(unsafe.Pointer(cMethod))
 	var cRequest *C.uint8_t
@@ -278,9 +294,14 @@ func goHostCall(method string, requestJSON []byte) ([]byte, error) {
 	var response C.cliproxy_buffer
 	rc := C.call_host_api(cMethod, cRequest, C.size_t(len(requestJSON)), &response)
 	var responseBytes []byte
+	if response.ptr != nil {
+		defer C.free_host_buffer(response.ptr, response.len)
+	}
+	if uint64(response.len) > maxRPCBytes || (response.ptr == nil && response.len > 0) {
+		return nil, fmt.Errorf("invalid or oversized host callback response")
+	}
 	if response.ptr != nil && response.len > 0 {
 		responseBytes = C.GoBytes(unsafe.Pointer(response.ptr), C.int(response.len))
-		C.free_host_buffer(response.ptr, response.len)
 	}
 	if rc != 0 && responseBytes == nil {
 		return nil, &ocError{Code: "host_call_failed", Message: fmt.Sprintf("host %s returned %d", method, rc)}
@@ -304,9 +325,16 @@ func goHostCallJson(method string, request any) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	return decodeHostResult(responseBytes)
+}
+
+func decodeHostResult(responseBytes []byte) (json.RawMessage, error) {
 	var env envelope
 	if err := json.Unmarshal(responseBytes, &env); err != nil {
 		return nil, err
+	}
+	if !env.OK || env.Error != nil || len(env.Result) == 0 {
+		return nil, fmt.Errorf("host callback did not return a successful result")
 	}
 	return env.Result, nil
 }

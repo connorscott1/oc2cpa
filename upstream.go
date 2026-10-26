@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,73 +20,74 @@ const upstreamUserAgent = "opencode/latest/2.0.29/cli"
 const upstreamAuthHeader = "Bearer public"
 
 var (
-	httpClientsMu   sync.Mutex
-	sharedClient    *http.Client
-	sharedClientKey string
-	proxyClients    = map[string]*http.Client{}
+	httpClientsMu sync.Mutex
+	proxyClients  = map[string]*http.Client{}
 )
 
-// sharedHTTPClient lazily builds (and rebuilds on config change) the upstream
-// HTTP client. The connect timeout only bounds dial + response headers; once
-// the upstream starts streaming, reads are bounded by the response-layer
-// watchdogs, never cut short mid-generation.
-func sharedHTTPClient() *http.Client {
-	settingsSnapshot := readSettings()
-	key := fmt.Sprintf("t=%d|p=%s", settingsSnapshot.ConnectTimeoutMS, readHostProxy())
-	httpClientsMu.Lock()
-	defer httpClientsMu.Unlock()
-	if sharedClient != nil && sharedClientKey == key {
-		return sharedClient
-	}
-	sharedClient = buildClient(readHostProxy(), settingsSnapshot.ConnectTimeoutMS)
-	sharedClientKey = key
-	return sharedClient
+// Clients retain normal TLS verification and honor explicit proxies without
+// silently falling back to a different route. The total deadline also covers
+// response bodies; redirects must not send a conversation to another endpoint.
+func sharedHTTPClient() (*http.Client, error) {
+	return clientForAuth("")
 }
 
-// clientForAuth returns (and caches) an HTTP client honoring the optional
-// proxy_url stored in the auth file, so multiple auth files can use different
-// exit IPs the way the original deployment ran one oc2cpa instance per IP.
-// An auth without its own proxy falls back to the host's global proxy-url.
-// socks5/socks5h proxies are ignored by the stdlib transport and pass through;
-// unsupported schemes are logged and skipped.
-func clientForAuth(proxyURL string) *http.Client {
+func clientForAuth(proxyURL string) (*http.Client, error) {
 	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
 		proxyURL = readHostProxy()
 	}
-	settingsSnapshot := readSettings()
-	key := fmt.Sprintf("p=%s|t=%d", proxyURL, settingsSnapshot.ConnectTimeoutMS)
+	cfg := readSettings()
+	key := fmt.Sprintf("%s|%d|%d", proxyURL, cfg.ConnectTimeoutMS, cfg.RequestTimeoutMS)
 	httpClientsMu.Lock()
 	defer httpClientsMu.Unlock()
 	if client, ok := proxyClients[key]; ok {
-		return client
+		return client, nil
 	}
-	client := buildClient(proxyURL, settingsSnapshot.ConnectTimeoutMS)
+	client, err := buildClient(proxyURL, cfg.ConnectTimeoutMS)
+	if err != nil {
+		return nil, err
+	}
+	deadline := cfg.RequestTimeoutMS
+	if deadline <= 0 {
+		deadline = 600_000
+	}
+	client.Timeout = time.Duration(deadline) * time.Millisecond
+	if len(proxyClients) >= 32 {
+		for k, old := range proxyClients {
+			old.CloseIdleConnections()
+			delete(proxyClients, k)
+		}
+	}
 	proxyClients[key] = client
-	return client
+	return client, nil
 }
 
-func buildClient(proxyURL string, connectTimeoutMS int) *http.Client {
-	timeout := time.Duration(connectTimeoutMS) * time.Millisecond
+func buildClient(proxyURL string, connectTimeoutMS int) (*http.Client, error) {
+	timeout := time.Duration(clampConnectTimeout(connectTimeoutMS)) * time.Millisecond
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = timeout
 	transport.TLSHandshakeTimeout = timeout
-	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
-		return dialer.DialContext(ctx, network, addr)
-	}
+	transport.DialContext = (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext
 	if proxyURL != "" {
-		if parsed, err := url.Parse(proxyURL); err == nil && isHTTPishProxy(parsed.Scheme) {
+		parsed, err := url.Parse(proxyURL)
+		if err != nil || parsed.Hostname() == "" || parsed.Opaque != "" ||
+			parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+			return nil, fmt.Errorf("invalid configured proxy URL")
+		}
+		switch parsed.Scheme {
+		case "http", "https", "socks5", "socks5h":
 			transport.Proxy = http.ProxyURL(parsed)
-		} else {
-			fsDebugLog("ignoring unsupported proxy scheme for " + proxyURL)
+		default:
+			return nil, fmt.Errorf("unsupported configured proxy scheme")
 		}
 	}
-	return &http.Client{Transport: transport}
-}
-
-func isHTTPishProxy(scheme string) bool {
-	return scheme == "http" || scheme == "https"
+	return &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Minute,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return fmt.Errorf("upstream redirects are disabled")
+		},
+	}, nil
 }
 
 // upstreamHeaders mirrors zen.fetchUpstream: the upstream merges sessions on
@@ -139,9 +139,4 @@ func fsDebugLog(message string) {
 	// The c-shared plugin shares the host process, so this writes to the
 	// host's stderr — the same stream CLIProxyAPI's console logger uses.
 	fmt.Fprintln(os.Stderr, "[oc2cpa] "+message)
-}
-
-// ioReadAll small helper for bounded model-list reads.
-func readAllBounded(body io.Reader, maxBytes int64) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(body, maxBytes))
 }

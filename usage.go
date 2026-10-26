@@ -9,6 +9,7 @@ package main
 // host's wire format: Go field names, nested Detail and Failure objects.
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -281,15 +282,12 @@ func formatUsageLog(record pluginapi.UsageRecord) string {
 	return string(out)
 }
 
-// redactKey keeps log scrapes from leaking client keys: only a short prefix
-// of the API key identifier survives into the usage log.
+// redactKey gives operators a stable client label without exposing key bytes.
 func redactKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return ""
 	}
-	if len(key) <= 8 {
-		return strings.Repeat("*", len(key))
-	}
-	return key[:8] + "..."
+	sum := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("client-%x", sum[:6])
 }

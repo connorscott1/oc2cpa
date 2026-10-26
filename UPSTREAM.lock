@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/dingguotu/oc2cpa.git",
+  "reviewed_commit": "bf2c778cc1e3479f7e6b5226e2a87a31f739c3d8",
+  "host_version": "v8.0.44",
+  "host_commit": "1f917e77c4562623aa49e9804d999524151a2f96",
+  "go_version": "1.26.10"
+}

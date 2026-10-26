@@ -2,6 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -96,21 +100,37 @@ type hostAuthListResponse struct {
 	Files []pluginapi.HostAuthFileEntry `json:"files"`
 }
 
+var bootstrapMu sync.Mutex
+
 // bootstrapAuthOnce creates the synthetic auth file on first registration so
 // the plugin is usable right after the two-line config.yaml addition. Failure
 // is non-fatal: the user can also drop an oc2cpa.json into auth-dir manually.
 func bootstrapAuthOnce() {
-	responseBytes, err := goHostCall(pluginabi.MethodHostAuthList, []byte("{}"))
+	if err := bootstrapAuth(goHostCallJson); err != nil {
+		fsDebugLog("synthetic credential setup failed; existing files were not intentionally replaced")
+	}
+}
+
+// The host callback returns an envelope; callers must inspect result.files.
+// Serialize our own registrations and never save over an existing name, even
+// when the existing file has a different provider or is disabled.
+func bootstrapAuth(call func(string, any) (json.RawMessage, error)) error {
+	bootstrapMu.Lock()
+	defer bootstrapMu.Unlock()
+	responseBytes, err := call(pluginabi.MethodHostAuthList, struct{}{})
 	if err != nil {
-		return
+		return err
 	}
 	var list hostAuthListResponse
 	if err := json.Unmarshal(responseBytes, &list); err != nil {
-		return
+		return err
+	}
+	if list.Files == nil {
+		return fmt.Errorf("host credential list is missing files")
 	}
 	for _, file := range list.Files {
-		if file.Provider == providerName || file.Type == providerName {
-			return
+		if file.Provider == providerName || file.Type == providerName || strings.EqualFold(filepath.Base(file.Name), providerName+".json") {
+			return nil
 		}
 	}
 	payload, _ := json.Marshal(map[string]any{
@@ -119,10 +139,9 @@ func bootstrapAuthOnce() {
 		"label":     "OpenCode free models (anonymous)",
 		"proxy_url": "",
 	})
-	if _, err := goHostCallJson(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
+	_, err = call(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
 		Name: providerName + ".json",
 		JSON: json.RawMessage(payload),
-	}); err != nil {
-		fsDebugLog("auto-bootstrap oc2cpa.json auth file failed: " + err.Error())
-	}
+	})
+	return err
 }

@@ -1,4 +1,11 @@
-# oc2cpa — OpenCode free models for CLIProxyAPI
+# oc2cpa — maintained security fork
+
+This is [connorscott1/oc2cpa](https://github.com/connorscott1/oc2cpa), based on upstream v0.4.3.
+See [maintenance and pinned builds](docs/MAINTENANCE.md) for the fixes, exact
+CLIProxyAPI v8.0.44 target, artifact verification, and update-review procedure.
+The dashboard is retained. No release or installation is implied by this branch.
+
+## Upstream functionality
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -43,7 +50,7 @@ server, renamed and repackaged as **oc2cpa**.
 - **Watchdog timeouts.** First event within 30 s, body idle within 120 s, and
   a 1 s trailing window after `[DONE]` so late `usage` frames are still
   captured. The connect timeout only bounds dial + response headers — once
-  the upstream starts streaming, generation is never cut short.
+  the upstream starts streaming, generation is also bounded by the total request deadline.
 - **Synthetic auth.** A single `oc2cpa.json` auth file (auto-created on first
   registration) keeps the plugin usable immediately; optionally set a
   `proxy_url` inside it to give that credential its own exit IP. Without it
@@ -57,7 +64,7 @@ server, renamed and repackaged as **oc2cpa**.
 plugins:
   enabled: true
   store-sources:
-    - https://github.com/dingguotu/oc2cpa/releases/latest/download/registry.json
+    - https://github.com/connorscott1/oc2cpa/releases/download/v0.4.4-connorscott.1/registry.json
 ```
 
 Then install `oc2cpa` from the CLIProxyAPI management UI.
@@ -125,7 +132,7 @@ usage record per request back into the plugin, which prints a single
 
 It carries the model, stream/failure status, total latency and TTFT, and the
 `input / output / reasoning / cached / total` token counters (the client API
-key is redacted to a short prefix). Failed requests include the upstream
+key is replaced by a short hash). Failed requests include the upstream
 `status` code instead of token counters. The same metrics are recorded into
 CLIProxyAPI's own usage database, so the management UI statistics page shows
 them as well. Set `usage_log: false` to silence the console lines.
@@ -150,7 +157,7 @@ supports plugin resources.
 
 ## Development
 
-Requires Go 1.26+. Build the shared library for the local machine:
+Requires Go 1.26.10. Build the shared library for the local machine:
 
 ```bash
 go build -buildmode=c-shared -o dist/oc2cpa.dll .        # Windows

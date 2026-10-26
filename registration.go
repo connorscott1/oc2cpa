@@ -17,11 +17,13 @@ const providerName = "oc2cpa"
 
 // version is overridden at build time via -ldflags "-X main.version=x.y.z".
 var version = "0.0.0"
+var sourceCommit = "development"
 
 var settingsMu sync.RWMutex
 var settings = pluginSettings{
 	UpstreamBaseURL:  "https://opencode.ai/inference/v1",
 	ConnectTimeoutMS: 60_000,
+	RequestTimeoutMS: 600_000,
 	DynamicModels:    false,
 	UsageLog:         true,
 }
@@ -32,6 +34,7 @@ var settings = pluginSettings{
 type pluginSettings struct {
 	UpstreamBaseURL  string
 	ConnectTimeoutMS int
+	RequestTimeoutMS int
 	DynamicModels    bool
 	UsageLog         bool
 }
@@ -45,8 +48,8 @@ func configure(requestJSON []byte) {
 	}
 	parsed := parseSettings(req.ConfigYAML)
 	settingsMu.Lock()
-	defer settingsMu.Unlock()
 	settings = parsed
+	settingsMu.Unlock()
 	invalidateModelCache()
 }
 
@@ -68,6 +71,7 @@ func parseSettings(configYAML []byte) pluginSettings {
 	parsed := pluginSettings{
 		UpstreamBaseURL:  "https://opencode.ai/inference/v1",
 		ConnectTimeoutMS: 60_000,
+		RequestTimeoutMS: 600_000,
 		DynamicModels:    false,
 		UsageLog:         true,
 	}
@@ -93,6 +97,10 @@ func parseSettings(configYAML []byte) pluginSettings {
 		case "connect_timeout_ms":
 			if n, err := strconv.Atoi(value); err == nil {
 				parsed.ConnectTimeoutMS = clampConnectTimeout(n)
+			}
+		case "request_timeout_ms":
+			if n, err := strconv.Atoi(value); err == nil {
+				parsed.RequestTimeoutMS = max(1, min(n, 1_800_000))
 			}
 		case "dynamic_models":
 			parsed.DynamicModels = value == "true"
@@ -121,6 +129,7 @@ func clampConnectTimeout(ms int) int {
 // registrationPayload is the plugin.register response payload. The host
 // requires non-empty metadata and at least one capability.
 type registrationPayload struct {
+	BuildCommit   string             `json:"build_commit,omitempty"`
 	SchemaVersion uint32             `json:"schema_version"`
 	Metadata      pluginapi.Metadata `json:"metadata"`
 	Capabilities  map[string]any     `json:"capabilities"`
@@ -128,6 +137,7 @@ type registrationPayload struct {
 
 func registration() registrationPayload {
 	return registrationPayload{
+		BuildCommit: sourceCommit,
 		// Plugin RPC schema contract version (see sdk/pluginabi/types.go):
 		// 6 preserves raw JSON for management responses; the plugin does not
 		// rely on per-chunk request bodies or history chunks.
@@ -135,8 +145,8 @@ func registration() registrationPayload {
 		Metadata: pluginapi.Metadata{
 			Name:             "OC2CPA (OpenCode free models)",
 			Version:          version,
-			Author:           "dingguotu",
-			GitHubRepository: "https://github.com/dingguotu/oc2cpa",
+			Author:           "connorscott1 (fork of dingguotu/oc2cpa)",
+			GitHubRepository: "https://github.com/connorscott1/oc2cpa",
 			Logo:             "https://opencode.ai/favicon.svg",
 			ConfigFields: []pluginapi.ConfigField{
 				{
@@ -150,6 +160,12 @@ func registration() registrationPayload {
 					Type:        pluginapi.ConfigFieldTypeInteger,
 					Default:     60000,
 					Description: "Milliseconds to wait for the upstream response headers before giving up (1..600000)",
+				},
+				{
+					Name:        "request_timeout_ms",
+					Type:        pluginapi.ConfigFieldTypeInteger,
+					Default:     600000,
+					Description: "Total upstream request deadline including response body (1..1800000 ms)",
 				},
 				{
 					Name:        "dynamic_models",
